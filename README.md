@@ -1,0 +1,121 @@
+# QQ 机器人（SnowLuma + DSH）部署笔记
+
+把一个 QQ 号接上大模型，让它像群友一样聊天 —— 从零部署到云端运维的完整笔记。
+
+> 这些笔记来自一次**真实部署**（阿里云 ECS / Ubuntu 24.04），
+> 中间踩过的坑、误判、以及自己造出来的故障都原样记录，没有事后美化。
+
+---
+
+## 这套东西是什么
+
+```
+QQ服务器 ⇄ SnowLuma(容器) ⇄ qq-bridge(Node) ⇄ DSH(AI)
+          把QQ变成API      翻译 + 记忆 + 唤醒    agent 本体
+```
+
+- **SnowLuma**：容器里跑一个真实的 Linux QQ 客户端，通过 hook 注入把 QQ 能力暴露成 OneBot v11 协议
+- **qq-bridge**：收 QQ 消息 → 判断要不要叫醒 AI → 组装提示词；反过来把 AI 的工具调用转成 QQ 操作
+- **DSH**：agent 本体，跑「读提示词 → 请求大模型 → 调工具 → 循环」
+
+**三条硬约束**（决定了架构，动手前必须先理解）：
+
+1. **三者必须同机** —— 桥接要用 `~/.dsh` 的本地凭证离线签发 cookie 去连 DSH
+2. **必须网络隔离** —— SnowLuma 的四个端口合起来等于 QQ 的完全控制权，只能绑 `127.0.0.1`
+3. **资源要实测** —— 实测吃 ~1.35GB，2G 是极限，建议 4G
+
+---
+
+## 笔记目录
+
+| # | 笔记 | 内容 |
+|---|---|---|
+| 01 | [部署教程 · 学习版](docs/01-部署教程-学习版.md) | **最完整的一份**。按「架构 → 分步 → 运维 → 排错方法论 → 踩坑复盘」组织，重点是每一步的**为什么** |
+| 02 | [部署流程 · 精简总结](docs/02-部署流程-精简总结.md) | 压缩版，五分钟看完、照着能重做一遍。**赶时间看这份** |
+| 03 | [运维手册](docs/03-运维手册.md) | 线上跑起来之后的全部内容：体检、内存调优、解卡、以及 11 条踩坑记录（带根因） |
+| 04 | [人格卡 · 闽越大王](docs/04-人格卡-闽越大王.md) | 一份「傲娇少女」人格提示词示例，说明角色卡该怎么写才不像 AI |
+| 05 | [角色绘画提示词](docs/05-角色绘画提示词.md) | 把文字人设转成 AI 绘画提示词的方法（英文 tag / 中文自然语言 / MJ 三套） |
+
+---
+
+## 最短路径（TL;DR）
+
+```bash
+# 1. 装 Docker（用发行版源，比 docker-ce 官方源快一个数量级）
+apt-get install -y docker.io docker-compose-v2
+
+# 2. ⚠️ 配镜像加速器 —— 国内云主机上 Docker Hub 基本不通，不配后面必挂
+#    配完一定要实测：docker pull alpine
+
+# 3. 装 Node + pnpm（⚠️ Linux 上 DSH 不自带 pnpm）
+npm i -g @deepseek-ai/dsh pnpm
+
+# 4. SnowLuma 容器（cap_add SYS_PTRACE / seccomp=unconfined / shm_size 1gb / 端口全绑 127.0.0.1）
+docker compose up -d
+
+# 5. DSH 凭证搬过来并收权限（⚠️ 不是 600 的话 DSH 拒绝启动）
+chmod 600 ~/.dsh/.credentials.yaml
+
+# 6. systemd 起 dsh（端口必须钉死）和 qq-bridge（⚠️ 用 /usr/bin/env node）
+systemctl enable --now dsh qq-bridge
+
+# 7. 扫码登录 QQ —— 判定成功的唯一标准是日志里有 login detected
+docker logs snowluma | grep 'login detected'
+```
+
+完整步骤见 [02-部署流程-精简总结](docs/02-部署流程-精简总结.md)。
+
+---
+
+## 出问题怎么查
+
+**分层定位，不要猜。** 看数据流断在哪一层：
+
+| 层 | 怎么测 | 健康表现 |
+|---|---|---|
+| ① QQ 登录 | `docker logs snowluma \| grep 'login detected'` | 最近有记录 |
+| ② OneBot | `curl -X POST localhost:3000/get_login_info` | `{"status":"ok"}` |
+| ② 桥接收 QQ | `journalctl -u qq-bridge` | `SnowLuma 已连接` |
+| ③ DSH | `/api/status` 的 `dshReady` | `true` |
+| ③ AI 出话 | `/api/status` 的 `activity` | 有 `工具统一发送：成功 N/N 条` |
+
+> **心法：不要看「服务还活着吗」，要看「数据流到哪一步断的」。**
+> 服务全是 `active` 却在装死，是这类系统最常见的故障形态。
+
+---
+
+## 这份笔记里最值得看的三个部分
+
+**① [排错方法论](docs/01-部署教程-学习版.md#第-4-章-排错方法论本文最有价值的部分)**
+三个真实故障的推理过程 —— 从"服务都正常但机器人不回话"，一路查到内核的 `direct reclaim`。
+包括每一步用什么命令、怎么从现象推到根因。
+
+**② 我自己犯的三个错**（同上，第 4.3 节）
+写了两个看门狗，**两个都造成了故障**：
+
+- 「卡死自动重启」的判定条件与 AI 的"睡前观察"长等待完全重合 → 每 10 分钟误判、打断正常对话
+- dsh 内存 GC 阈值定成 400MB，而 dsh 正常水位就是 400~460MB → 每十几分钟在回合中重启一次，把系统弄坏
+
+> **教训：写自动运维脚本前，先问"正常情况会不会也长这样"。监控的误报比不监控更糟。**
+
+**③ [踩坑总表](docs/03-运维手册.md)**
+11 条坑按根因分类。其中 6 条是「我以为 A，实际是 B」造成的 ——
+以为 `127` 是命令找不到、以为服务 active 就是好的、以为内存没满就不会卡死。
+
+---
+
+## 注意事项
+
+- 这套方案基于**非官方协议**改 QQ 客户端行为，存在账号风险，仅供学习和自用
+- 所有示例里的 IP、QQ 号、密码、令牌都已替换成占位符
+- QQ 同一账号**同一类设备**只能有一个登录：容器里算「电脑端」，在另一台电脑登同一个号会把机器人顶掉，需要重新扫码
+
+---
+
+## 资料来源
+
+| 组件 | 说明 |
+|---|---|
+| [SnowLuma](https://github.com/MotricSeven7/SnowLuma) | OneBot v11 网关，容器里跑真实 Linux QQ |
+| qq-bridge | QQ ↔ DSH 桥接 |
+| [DSH](https://www.npmjs.com/package/@deepseek-ai/dsh) | DeepSeek Harness，agent 框架 |
