@@ -120,3 +120,13 @@ docker logs snowluma | grep 'login detected'
 | [SnowLuma](https://github.com/MotricSeven7/SnowLuma) | OneBot v11 网关，容器里跑真实 Linux QQ |
 | qq-bridge | QQ ↔ DSH 桥接 |
 | [DSH](https://www.npmjs.com/package/@deepseek-ai/dsh) | DeepSeek Harness，agent 框架 |
+
+### 对线人格与运维实战（2026-11 补充）
+
+| 文档 | 内容 |
+|---|---|
+| [07 · 对线人格调优实验记录](docs/07-对线人格调优实验记录.md) | **让机器人学会骂人的完整排查（含全部失败）**。核心结论：提示词改不动模型的角色价值判断 |
+| [08 · 桥接层 Bug 修复记录](docs/08-桥接层Bug修复记录.md) | 三个真实 bug：唤醒被误丢弃 / 回合无限长 / dsh 内存抖动卡 D 状态 |
+| [09 · 手机访问与内存守护](docs/09-手机访问与内存守护.md) | nginx 反代 + Host/Origin 校验绕过 + memguard 自动重启 |
+| [10 · 真实语料分析方法](docs/10-真实语料分析方法.md) | 从自己的 QQ 记录统计「真人怎么说话」，含机器人识别和人味指标 |
+| [11 · 人格卡：闽越对线王](docs/11-人格卡-闽越对线王.md) | 群聊专用人格，阴阳为主武器 |
